@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram AI Assistant — v3
+Telegram AI Assistant — v4 (webhook mode)
 AI: Groq (free tier, llama-3.3-70b) with function calling
-Features: Web search, reminders, Google Sheets notes, Google Calendar
+Webhook mode: no polling conflicts on Railway
 """
 import os
 import json
@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
+WEBHOOK_URL        = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+PORT               = int(os.environ.get("PORT", 8080))
 ALLOWED_USER_IDS   = os.environ.get("ALLOWED_USER_IDS", "")
 GOOGLE_SA_JSON     = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID", "")
@@ -346,7 +348,7 @@ async def post_init(app: Application):
     global _bot_app
     _bot_app = app
     scheduler.start()
-    logger.info("Bot v3 running — Groq llama-3.3-70b.")
+    logger.info(f"Bot v4 running — webhook on port {PORT}")
 
 
 def main():
@@ -360,8 +362,18 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Starting bot...")
-    app.run_polling(drop_pending_updates=True)
+
+    if WEBHOOK_URL:
+        logger.info(f"Starting in webhook mode: {WEBHOOK_URL}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("No WEBHOOK_URL set — falling back to polling")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
