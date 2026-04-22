@@ -1,5 +1,5 @@
 python-telegram-bot==21.6
-google-genai>=0.8.0
+groq>=0.9.0
 apscheduler==3.10.4
 duckduckgo-search==6.2.6
 gspread==6.1.2
