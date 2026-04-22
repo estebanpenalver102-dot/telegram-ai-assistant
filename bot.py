@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-Telegram AI Assistant — v2
+Telegram AI Assistant — v3
+AI: Groq (free tier, llama-3.3-70b) with function calling
 Features: Web search, reminders, Google Sheets notes, Google Calendar
-AI: Gemini 2.0 Flash (free tier) with function calling via google-genai SDK
 """
 import os
 import json
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 import pytz
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
+from groq import Groq
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Optional Google integrations
@@ -34,122 +32,124 @@ try:
 except ImportError:
     DDG_AVAILABLE = False
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 ALLOWED_USER_IDS   = os.environ.get("ALLOWED_USER_IDS", "")
 GOOGLE_SA_JSON     = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 USER_TIMEZONE      = os.environ.get("USER_TIMEZONE", "America/New_York")
+MODEL              = "llama-3.3-70b-versatile"
 
 ALLOWED_IDS = set(int(x.strip()) for x in ALLOWED_USER_IDS.split(",") if x.strip())
 
-# ─── Gemini client ───────────────────────────────────────────────────────────
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL  = "gemini-2.0-flash"
+client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = (
     "You are a smart personal AI assistant on Telegram. "
-    "You proactively use your tools when needed: search the web for current info, "
+    "Use your tools proactively when needed: search the web for current info, "
     "set reminders, save notes to Google Sheets, and check calendar events. "
-    "Be concise and practical. Use plain text, no markdown. "
-    "When setting a reminder, always confirm the exact time. "
+    "Be concise and practical. Use plain text — no markdown. "
+    "When setting a reminder, confirm the exact time. "
     "When searching, summarize findings briefly."
 )
 
-TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="web_search",
-        description="Search the web for current news, facts, prices, weather, or any real-time info.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={"query": types.Schema(type="STRING", description="Search query")},
-            required=["query"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="set_reminder",
-        description="Set a reminder that will ping the user after N minutes.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "message": types.Schema(type="STRING", description="Reminder message"),
-                "minutes": types.Schema(type="INTEGER", description="Minutes from now"),
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current news, facts, prices, weather, or any real-time info.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
             },
-            required=["message", "minutes"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="save_note",
-        description="Save a note or piece of information to Google Sheets.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "title":   types.Schema(type="STRING", description="Short title"),
-                "content": types.Schema(type="STRING", description="Note body"),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": "Set a reminder that will ping the user after N minutes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Reminder message"},
+                    "minutes": {"type": "integer", "description": "Minutes from now"},
+                },
+                "required": ["message", "minutes"],
             },
-            required=["title", "content"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="get_calendar",
-        description="Fetch upcoming calendar events.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={"days": types.Schema(type="INTEGER", description="Days ahead (default 7)")},
-            required=[],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="get_datetime",
-        description="Get current date and time.",
-        parameters=types.Schema(type="OBJECT", properties={}, required=[]),
-    ),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_note",
+            "description": "Save a note to Google Sheets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":   {"type": "string", "description": "Short title"},
+                    "content": {"type": "string", "description": "Note body"},
+                },
+                "required": ["title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar",
+            "description": "Fetch upcoming calendar events.",
+            "parameters": {
+                "type": "object",
+                "properties": {"days": {"type": "integer", "description": "Days ahead (default 7)"}},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_datetime",
+            "description": "Get current date and time.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
 ]
 
-GEN_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
-    tool_config=types.ToolConfig(
-        function_calling_config=types.FunctionCallingConfig(mode="AUTO")
-    ),
-)
-
-# ─── Scheduler ───────────────────────────────────────────────────────────────
+# ── Scheduler & state ─────────────────────────────────────────────────────────
 scheduler = AsyncIOScheduler(timezone=USER_TIMEZONE)
-
-# ─── Conversation history (per user) ─────────────────────────────────────────
 user_histories: dict[int, list] = {}
 _bot_app: Optional[Application] = None
 
 
-# ─── Tool implementations ─────────────────────────────────────────────────────
+# ── Tool implementations ──────────────────────────────────────────────────────
 
 def _web_search(query: str) -> str:
     if not DDG_AVAILABLE:
-        return "Web search is unavailable."
+        return "Web search unavailable."
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
         if not results:
             return "No results found."
-        lines = [f"\u2022 {r.get('title','')}\n  {r.get('body','')}" for r in results[:5]]
-        return "\n\n".join(lines)
+        return "\n\n".join(f"• {r.get('title','')}\n  {r.get('body','')}" for r in results[:5])
     except Exception as e:
         return f"Search error: {e}"
 
 
 def _save_note(title: str, content: str) -> str:
     if not GOOGLE_AVAILABLE or not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
-        return "\u26a0\ufe0f Google Sheets not configured (set GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_SHEET_ID)."
+        return "⚠️ Google Sheets not configured."
     try:
         sa = json.loads(GOOGLE_SA_JSON)
         creds = Credentials.from_service_account_info(
@@ -164,14 +164,14 @@ def _save_note(title: str, content: str) -> str:
             ws.append_row(["Date", "Title", "Content"])
         ts = datetime.now(pytz.timezone(USER_TIMEZONE)).strftime("%Y-%m-%d %H:%M")
         ws.append_row([ts, title, content])
-        return f'\u2705 Note saved: "{title}"'
+        return f'✅ Note saved: "{title}"'
     except Exception as e:
         return f"Sheets error: {e}"
 
 
 def _get_calendar(days: int = 7) -> str:
     if not GOOGLE_AVAILABLE or not GOOGLE_SA_JSON:
-        return "\u26a0\ufe0f Google Calendar not configured (set GOOGLE_SERVICE_ACCOUNT_JSON)."
+        return "⚠️ Google Calendar not configured."
     try:
         sa = json.loads(GOOGLE_SA_JSON)
         creds = Credentials.from_service_account_info(
@@ -200,24 +200,23 @@ def _get_calendar(days: int = 7) -> str:
                 ts = dt.strftime("%a %b %d, %I:%M %p")
             else:
                 ts = start
-            lines.append(f"\u2022 {e.get('summary', 'Untitled')} \u2014 {ts}")
+            lines.append(f"• {e.get('summary','Untitled')} — {ts}")
         return "\n".join(lines)
     except Exception as e:
         return f"Calendar error: {e}"
 
 
 def _get_datetime() -> str:
-    tz = pytz.timezone(USER_TIMEZONE)
-    return datetime.now(tz).strftime("%A, %B %d, %Y at %I:%M %p %Z")
+    return datetime.now(pytz.timezone(USER_TIMEZONE)).strftime("%A, %B %d, %Y at %I:%M %p %Z")
 
 
 def _dispatch_tool(name: str, args: dict, chat_id: int, user_id: int) -> str:
     if name == "web_search":
         return _web_search(args.get("query", ""))
     elif name == "set_reminder":
-        mins = int(args.get("minutes", 5))
-        msg  = args.get("message", "Reminder!")
-        tz   = pytz.timezone(USER_TIMEZONE)
+        mins   = int(args.get("minutes", 5))
+        msg    = args.get("message", "Reminder!")
+        tz     = pytz.timezone(USER_TIMEZONE)
         run_at = datetime.now(tz) + timedelta(minutes=mins)
         scheduler.add_job(
             _fire_reminder, "date",
@@ -239,29 +238,31 @@ async def _fire_reminder(chat_id: int, message: str):
     global _bot_app
     if _bot_app:
         try:
-            await _bot_app.bot.send_message(chat_id=chat_id, text=f"\u23f0 Reminder: {message}")
+            await _bot_app.bot.send_message(chat_id=chat_id, text=f"⏰ Reminder: {message}")
         except Exception as e:
-            logger.error(f"Reminder send failed: {e}")
+            logger.error(f"Reminder failed: {e}")
 
 
 def is_allowed(user_id: int) -> bool:
     return not ALLOWED_IDS or user_id in ALLOWED_IDS
 
 
+# ── Command handlers ──────────────────────────────────────────────────────────
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("Not authorized.")
         return
     await update.message.reply_text(
-        "\U0001f44b Hey! I'm your personal AI assistant.\n\n"
+        "👋 Hey! I'm your personal AI assistant.\n\n"
         "I can:\n"
-        "\U0001f50d Search the web for current info\n"
-        "\u23f0 Set reminders (\"remind me in 30 mins to call John\")\n"
-        "\U0001f4dd Save notes to Google Sheets (\"save note: ...\")\n"
-        "\U0001f4c5 Check your calendar (\"what's on my calendar this week?\")\n"
-        "\U0001f4ac Answer anything else\n\n"
-        "/clear \u2014 fresh conversation\n"
-        "/help \u2014 show this"
+        "🔍 Search the web for current info\n"
+        "⏰ Set reminders (\"remind me in 30 mins to call John\")\n"
+        "📝 Save notes to Google Sheets\n"
+        "📅 Check your calendar\n"
+        "💬 Answer anything\n\n"
+        "/clear — fresh conversation\n"
+        "/help — show this"
     )
 
 
@@ -269,8 +270,10 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     user_histories.pop(update.effective_user.id, None)
-    await update.message.reply_text("\u2705 Conversation cleared!")
+    await update.message.reply_text("✅ Conversation cleared!")
 
+
+# ── Main message handler ──────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -287,74 +290,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     history = user_histories.setdefault(user_id, [])
-    history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+    history.append({"role": "user", "content": user_text})
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
         for _ in range(6):
-            response = client.models.generate_content(
+            response = client.chat.completions.create(
                 model=MODEL,
-                contents=history,
-                config=GEN_CONFIG,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                max_tokens=1024,
             )
 
-            candidate = response.candidates[0] if response.candidates else None
-            if not candidate:
-                break
+            msg = response.choices[0].message
 
-            history.append(candidate.content)
+            if msg.tool_calls:
+                messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ]})
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                for tc in msg.tool_calls:
+                    args = json.loads(tc.function.arguments or "{}")
+                    logger.info(f"Tool: {tc.function.name}({args})")
+                    result = _dispatch_tool(tc.function.name, args, chat_id, user_id)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+            else:
+                reply = (msg.content or "").strip() or "Done!"
+                history.append({"role": "assistant", "content": reply})
+                if len(history) > 40:
+                    user_histories[user_id] = history[-40:]
+                if len(reply) > 4096:
+                    for i in range(0, len(reply), 4096):
+                        await update.message.reply_text(reply[i:i+4096])
+                else:
+                    await update.message.reply_text(reply)
+                return
 
-            fn_calls = [
-                p for p in candidate.content.parts
-                if p.function_call and p.function_call.name
-            ]
-            if not fn_calls:
-                break
-
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            result_parts = []
-            for p in fn_calls:
-                fc = p.function_call
-                args = dict(fc.args) if fc.args else {}
-                logger.info(f"Tool: {fc.name}({args})")
-                result = _dispatch_tool(fc.name, args, chat_id, user_id)
-                result_parts.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            name=fc.name,
-                            response={"result": result},
-                        )
-                    )
-                )
-            history.append(types.Content(role="user", parts=result_parts))
-
-        reply = ""
-        last_model = next((c for c in reversed(history) if c.role == "model"), None)
-        if last_model:
-            for part in last_model.parts:
-                if hasattr(part, "text") and part.text:
-                    reply += part.text
-
-        reply = reply.strip() or "Done!"
-
-        if len(history) > 40:
-            user_histories[user_id] = history[-40:]
-
-        if len(reply) > 4096:
-            for i in range(0, len(reply), 4096):
-                await update.message.reply_text(reply[i:i+4096])
-        else:
-            await update.message.reply_text(reply)
+        await update.message.reply_text("Done!")
 
     except Exception as e:
         logger.error(f"handle_message error: {e}", exc_info=True)
-        await update.message.reply_text("\u26a0\ufe0f Something went wrong. Try again!")
+        await update.message.reply_text("⚠️ Something went wrong. Try again!")
 
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
     global _bot_app
     _bot_app = app
     scheduler.start()
-    logger.info("Bot v2 running \u2014 Gemini 2.0 Flash + new SDK.")
+    logger.info("Bot v3 running — Groq llama-3.3-70b.")
 
 
 def main():
@@ -368,7 +360,6 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     logger.info("Starting bot...")
     app.run_polling(drop_pending_updates=True)
 
